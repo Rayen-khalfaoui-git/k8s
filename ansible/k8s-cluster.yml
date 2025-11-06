@@ -1,0 +1,267 @@
+---
+- name: Prepare all nodes (master + workers)
+  hosts: all
+  gather_facts: yes
+  vars:
+    pod_cidr: "192.168.0.0/16"   # Calico-friendly
+    kubernetes_apt_key_url: "https://packages.cloud.google.com/apt/doc/apt-key.gpg"
+    calico_manifest_url: "https://raw.githubusercontent.com/projectcalico/calico/v3.31.0/manifests/calico.yaml"
+  tasks:
+    - name: Ensure swap is off (temporary)
+      ansible.builtin.command: swapoff -a
+      become: true
+      changed_when: false
+
+    - name: Comment out swap in /etc/fstab
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([^#\n].*\s+swap\s+.*)$'
+        replace: '# \\1'
+        backup: yes
+
+    - name: Ensure kernel modules are loaded now
+      ansible.builtin.modprobe:
+        name: "{{ item }}"
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Ensure modules are loaded on boot
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+        mode: '0644'
+
+    - name: Ensure sysctl params for k8s
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-kubernetes-cri.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.ipv4.ip_forward                 = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+        mode: '0644'
+
+    - name: Reload sysctl
+      ansible.builtin.command: sysctl --system
+      register: sysctl_out
+      changed_when: "'kernel' in sysctl_out.stdout or sysctl_out.rc == 0"
+
+    - name: Update apt and install prerequisites
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+
+    - name: Install containerd
+      ansible.builtin.apt:
+        name: containerd
+        state: latest
+        update_cache: yes
+
+    - name: Ensure /etc/containerd exists
+      ansible.builtin.file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+
+    - name: Create containerd default config
+      ansible.builtin.command: containerd config default
+      register: containerd_default
+      changed_when: false
+      failed_when: containerd_default.rc != 0 and containerd_default.rc != 1
+      # Some distros return 0, some 1; we only want stdout
+
+    - name: Install containerd config file (idempotent)
+      ansible.builtin.copy:
+        dest: /etc/containerd/config.toml
+        content: "{{ containerd_default.stdout }}"
+        mode: '0644'
+      when: containerd_default.stdout is defined and containerd_default.stdout != ""
+
+    - name: Ensure SystemdCgroup = true in containerd config
+      ansible.builtin.replace:
+        path: /etc/containerd/config.toml
+        regexp: '(\s*SystemdCgroup\s*=\s*)false'
+        replace: '\1true'
+      notify: Restart containerd
+
+    - name: Ensure containerd service running & enabled
+      ansible.builtin.systemd:
+        name: containerd
+        state: started
+        enabled: yes
+
+    - name: Add Kubernetes apt key
+      ansible.builtin.apt_key:
+        url: "{{ kubernetes_apt_key_url }}"
+        state: present
+
+    - name: Add Kubernetes apt repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main"
+        filename: kubernetes
+        state: present
+        codename: "{{ ansible_lsb.codename | default('focal') }}"
+
+    - name: Ensure apt keyring location exists
+      ansible.builtin.file:
+        path: /usr/share/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Ensure Kubernetes key is saved in keyring file (dearmour)
+      ansible.builtin.command: >
+        curl -fsSL {{ kubernetes_apt_key_url }} | gpg --dearmour -o /usr/share/keyrings/kubernetes-archive-keyring.gpg
+      args:
+        creates: /usr/share/keyrings/kubernetes-archive-keyring.gpg
+      register: keyring_cmd
+      changed_when: keyring_cmd.rc == 0
+
+    - name: Install kubelet, kubeadm, kubectl
+      ansible.builtin.apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        update_cache: yes
+
+    - name: Hold kube packages
+      ansible.builtin.command: apt-mark hold kubelet kubeadm kubectl
+      args:
+        warn: false
+      changed_when: false
+
+    - name: Ensure kubelet is enabled (it may be started by kubeadm later)
+      ansible.builtin.systemd:
+        name: kubelet
+        enabled: yes
+        state: started
+      ignore_errors: yes
+
+  handlers:
+    - name: Restart containerd
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+
+- name: Initialize master (only master host)
+  hosts: master
+  become: true
+  gather_facts: yes
+  vars:
+    pod_cidr: "192.168.0.0/16"
+  tasks:
+    - name: Init kubeadm control plane (only if not already init)
+      ansible.builtin.command: >
+        kubeadm init --apiserver-advertise-address={{ ansible_default_ipv4.address }}
+                   --pod-network-cidr={{ pod_cidr }}
+      args:
+        creates: /etc/kubernetes/admin.conf
+      register: kubeadm_init
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Create .kube directory for ubuntu user (control user)
+      ansible.builtin.file:
+        path: /home/{{ ansible_user }}/.kube
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0700'
+
+    - name: Copy admin kubeconfig to user
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/{{ ansible_user }}/.kube/config
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0600'
+
+    - name: Apply Calico CNI manifest
+      ansible.builtin.command: kubectl apply -f {{ calico_manifest_url }}
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: calico_apply
+      retries: 3
+      delay: 5
+      until: calico_apply.rc == 0
+
+    - name: Wait for kubernetes system pods to be ready
+      ansible.builtin.command: kubectl wait --for=condition=Ready pods --all -n kube-system --timeout=180s
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: wait_output
+      failed_when: false
+
+    - name: Generate join command
+      ansible.builtin.command: kubeadm token create --print-join-command
+      register: join_cmd
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Save join command to file (for workers)
+      ansible.builtin.copy:
+        dest: /tmp/kube_join_cmd.sh
+        content: |
+          #!/bin/sh
+          {{ join_cmd.stdout }}
+        mode: '0700'
+
+    - name: Show join command (for debug)
+      ansible.builtin.debug:
+        msg: "{{ join_cmd.stdout }}"
+
+- name: Join workers to the cluster
+  hosts: workers
+  become: true
+  gather_facts: yes
+  tasks:
+    - name: Fetch join command from master
+      ansible.builtin.slurp:
+        src: /tmp/kube_join_cmd.sh
+      delegate_to: 192.168.122.18
+      register: join_script_b64
+
+    - name: Write join script locally on worker
+      ansible.builtin.copy:
+        dest: /tmp/kube_join_cmd.sh
+        content: "{{ join_script_b64.content | b64decode }}"
+        mode: '0700'
+
+    - name: Run kubeadm join (idempotent)
+      ansible.builtin.command: sh /tmp/kube_join_cmd.sh
+      args:
+        creates: /etc/kubernetes/kubelet.conf
+      register: join_result
+      failed_when: join_result.rc != 0 and 'already a member of the cluster' not in join_result.stdout
+
+    - name: Ensure kubelet is running
+      ansible.builtin.systemd:
+        name: kubelet
+        state: started
+        enabled: yes
+
+- name: Pull admin kubeconfig to control machine (local)
+  hosts: master
+  connection: local
+  gather_facts: no
+  tasks:
+    - name: Create local .kube dir
+      local_action: file path=~/.kube state=directory mode=0700
+
+    - name: Copy admin.conf from master to local control host
+      local_action: command scp -o StrictHostKeyChecking=no {{ ansible_user }}@{{ inventory_hostname }}:/etc/kubernetes/admin.conf ~/.kube/config
+      # If you use SSH keys & known_hosts, remove StrictHostKeyChecking option
+
+    - name: Fix local kubeconfig ownership
+      local_action: command chown $(id -u):$(id -g) ~/.kube/config
+      ignore_errors: true
