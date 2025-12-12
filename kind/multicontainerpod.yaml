@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp-deployment
+  labels:
+    app: myapp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: myapp
+  template:
+    metadata:
+      labels:
+        app: myapp
+    spec:
+      initContainers:
+        - name: init-myservice
+          image: busybox
+          command: ['sh', '-c']
+          args: ['until nslookup myservice.default.svc.cluster.local; do echo waiting for the service; sleep 2; done;']
+      containers:
+        - name: myapp-container
+          image: busybox
+          command: ['sh', '-c', 'echo app running && sleep 3600; ']
+          env:
+            - name: FIRSTNAME
+              value: "rayen" 
