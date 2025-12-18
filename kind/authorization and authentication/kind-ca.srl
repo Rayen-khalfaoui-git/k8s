@@ -1,0 +1,9 @@
+serial number created when we signed alice certificate when we ran:
+openssl x509 -req -in alice.csr -CA kind-ca.crt -CAkey kind-ca.key -CAcreateserial -out alice.crt -days 365
+# Keep the serial file safe
+mv kind-ca.srl ~/.kube/kind-ca.srl
+
+# When signing future certificates, reference it
+openssl x509 -req -in bob.csr -CA kind-ca.crt -CAkey kind-ca.key -CAserial ~/.kube/kind-ca.srl -out bob.crt -days 365
+
+#it is important to keep track of serial keys so we dont have duplicates, in prod environment we use a private database to keep track of serial keys

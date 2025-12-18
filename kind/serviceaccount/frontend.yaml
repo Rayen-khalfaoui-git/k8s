@@ -1,0 +1,106 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-app
+  namespace: microservices-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      serviceAccountName: frontend-sa  # Uses custom SA
+      containers:
+      - name: frontend
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: config-volume
+          mountPath: /etc/nginx/conf.d
+        - name: html-volume
+          mountPath: /usr/share/nginx/html
+        lifecycle:
+          postStart:
+            exec:
+              command: ["/bin/sh", "-c", "echo 'Frontend started with ServiceAccount: frontend-sa' > /tmp/startup.log"]
+      volumes:
+      - name: config-volume
+        configMap:
+          name: app-config
+      - name: html-volume
+        configMap:
+          name: frontend-html
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-html
+  namespace: microservices-demo
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Microservices Demo</title>
+      <style>
+        body { font-family: Arial; padding: 20px; }
+        .container { max-width: 800px; margin: 0 auto; }
+        .card { border: 1px solid #ccc; padding: 20px; margin: 10px 0; }
+        button { padding: 10px; background: #007bff; color: white; border: none; cursor: pointer; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <h1>Microservices Demo</h1>
+        <div class="card">
+          <h2>Frontend Pod</h2>
+          <p>ServiceAccount: frontend-sa</p>
+          <p>Namespace: microservices-demo</p>
+        </div>
+        <button onclick="fetchBackend()">Call Backend API</button>
+        <div id="result" class="card"></div>
+      </div>
+      <script>
+        async function fetchBackend() {
+          const result = document.getElementById('result');
+          result.innerHTML = 'Loading...';
+          
+          try {
+            // Frontend calls backend service
+            const response = await fetch('http://backend-service/health');
+            const data = await response.json();
+            result.innerHTML = `
+              <h3>Backend Response:</h3>
+              <pre>${JSON.stringify(data, null, 2)}</pre>
+              <p>✅ Frontend successfully called Backend using ServiceAccount permissions</p>
+            `;
+          } catch (error) {
+            result.innerHTML = `
+              <h3>Error:</h3>
+              <pre>${error.message}</pre>
+              <p>❌ Frontend cannot access Backend (check RBAC permissions)</p>
+            `;
+          }
+        }
+      </script>
+    </body>
+    </html>
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-service
+  namespace: microservices-demo
+spec:
+  type: NodePort  # Accessible from outside
+  selector:
+    app: frontend
+  ports:
+  - port: 80
+    targetPort: 80
+    nodePort: 30080  # Will be accessible at <node-ip>:30080

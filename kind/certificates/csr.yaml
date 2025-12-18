@@ -1,0 +1,16 @@
+apiVersion: certificates.k8s.io/v1
+kind: CertificateSigningRequest
+metadata:
+  name: my-adam
+spec:
+  request: base64encodedpublickey
+  signerName: kubernetes.io/kube-apiserver-client
+  usages:
+  - digital signature
+  - key encipherment
+  - server authentication
+  - client authentication
+  expirationSeconds: 86400
+  username: system:node:my-node
+  uid: "1234567890"
+  groups:

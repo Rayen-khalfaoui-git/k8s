@@ -1,0 +1,8 @@
+#the user must generate a key pair first
+openssl genrsa -out adam.key 2048
+openssl req -new -key adam.key -out adam.csr -subj "/CN=adam"
+kubectl apply -f certificatesigningrequest.yaml
+#now he new CSR needs to be approved
+kubectl certificate approve <certificate-signing-request-name>
+#or deny if needed
+kubectl certificate deny <certificate-signing-request-name>

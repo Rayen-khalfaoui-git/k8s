@@ -1,0 +1,20 @@
+#we generate a key for alice
+openssl genrsa -out alice.key 2048
+# Create certificate signing request (CSR)
+openssl req -new -key alice.key -out alice.csr -subj "/CN=alice/O=developers"
+# we extract kind's CA cert & key
+docker exec cka-cluster-control-plane cat /etc/kubernetes/pki/ca.crt > kind-ca.crt
+docker exec cka-cluster-control-plane cat /etc/kubernetes/pki/ca.key > kind-ca.key
+# we sign the CSR with cluster CA
+openssl x509 -req -in alice.csr -CA kind-ca.crt -CAkey kind-ca.key -CAcreateserial -out alice.crt -days 365
+# Get kind cluster endpoint
+kubectl cluster-info
+
+# Create alice's kubeconfig
+kubectl config set-credentials alice --client-certificate=alice.crt --client-key=alice.key --embed-certs=true
+
+kubectl config set-context alice-context --cluster=kind-kind --user=alice --namespace=default
+
+add user 
+# Switch to alice's context
+kubectl config use-context alice-context

@@ -1,0 +1,131 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-api
+  namespace: microservices-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      serviceAccountName: backend-sa
+      initContainers:
+      - name: init-db
+        image: postgres:15-alpine
+        env:
+        - name: PGPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: db-credentials
+              key: password
+        - name: PGUSER
+          valueFrom:
+            secretKeyRef:
+              name: db-credentials
+              key: username
+        command:
+        - /bin/sh
+        - -c
+        - |
+          until pg_isready -h postgres-service -U $PGUSER; do
+            echo "Waiting for PostgreSQL..."
+            sleep 2
+          done
+          psql -h postgres-service -U $PGUSER -d appdb -c "
+            CREATE TABLE IF NOT EXISTS users (
+              id SERIAL PRIMARY KEY,
+              name VARCHAR(100),
+              email VARCHAR(100)
+            );
+            INSERT INTO users (name, email) VALUES 
+              ('Alice', 'alice@example.com'),
+              ('Bob', 'bob@example.com')
+            ON CONFLICT DO NOTHING;
+          "
+      containers:
+      - name: backend
+        image: node:18-alpine
+        command: ["sh", "-c"]
+        args:
+        - |
+          # Install dependencies first
+          npm init -y --silent
+          npm install express pg --silent
+          
+          # Create server.js
+          cat > server.js << 'EOF'
+          const express = require('express');
+          const { Pool } = require('pg');
+          const app = express();
+          const port = 3000;
+          
+          const config = {
+            name: process.env.APP_NAME || 'Microservices Demo',
+            version: process.env.APP_VERSION || '1.0'
+          };
+          
+          const pool = new Pool({
+            host: process.env.DB_HOST || 'postgres-service',
+            port: 5432,
+            database: 'appdb',
+            user: process.env.DB_USER,
+            password: process.env.DB_PASSWORD,
+          });
+          
+          app.get('/health', (req, res) => {
+            res.json({ 
+              status: 'OK', 
+              service: 'backend',
+              config: config
+            });
+          });
+          
+          app.get('/users', async (req, res) => {
+            try {
+              const result = await pool.query('SELECT * FROM users');
+              res.json({ users: result.rows });
+            } catch (err) {
+              res.status(500).json({ error: err.message });
+            }
+          });
+          
+          app.get('/config', (req, res) => {
+            res.json(config);
+          });
+          
+          app.listen(port, () => {
+            console.log(`Backend API listening on port ${port}`);
+          });
+          EOF
+          
+          # Start server
+          node server.js
+        env:
+        - name: DB_HOST
+          value: "postgres-service"
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: db-credentials
+              key: username
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: db-credentials
+              key: password
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: api-keys
+              key: jwt-secret
+        - name: APP_NAME
+          value: "Microservices Demo"
+        - name: APP_VERSION
+          value: "1.0"
+        ports:
+        - containerPort: 3000
