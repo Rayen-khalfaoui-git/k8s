@@ -1,0 +1,42 @@
+---
+- name: Fix system time using your commands
+  hosts: all
+  become: yes
+  
+  tasks:
+    - name: Set timezone to UTC
+      timezone:
+        name: UTC
+    
+    - name: Install systemd-timesyncd
+      apt:
+        name: systemd-timesyncd
+        state: present
+        update_cache: yes
+        cache_valid_time: 3600
+    
+    - name: Start systemd-timesyncd service
+      systemd:
+        name: systemd-timesyncd
+        state: started
+        enabled: yes
+        daemon_reload: yes
+    
+    - name: Enable NTP synchronization
+      command: timedatectl set-ntp true
+      register: ntp_result
+      failed_when: false
+    
+    - name: Restart systemd-timesyncd
+      systemd:
+        name: systemd-timesyncd
+        state: restarted
+    
+    - name: Verify time synchronization
+      command: timedatectl status
+      register: time_status
+    
+    - debug:
+        msg: |
+          Time status:
+          {{ time_status.stdout_lines | join('\n          ') }}

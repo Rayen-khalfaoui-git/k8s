@@ -99,31 +99,36 @@
         state: started
         enabled: yes
 
-    - name: Add Kubernetes apt key
-      ansible.builtin.apt_key:
-        url: "{{ kubernetes_apt_key_url }}"
-        state: present
-
-    - name: Add Kubernetes apt repository
-      ansible.builtin.apt_repository:
-        repo: "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main"
-        filename: kubernetes
-        state: present
-        codename: "{{ ansible_lsb.codename | default('focal') }}"
-
-    - name: Ensure apt keyring location exists
+    - name: Create apt keyrings directory
       ansible.builtin.file:
-        path: /usr/share/keyrings
+        path: /etc/apt/keyrings
         state: directory
         mode: '0755'
 
-    - name: Ensure Kubernetes key is saved in keyring file (dearmour)
-      ansible.builtin.command: >
-        curl -fsSL {{ kubernetes_apt_key_url }} | gpg --dearmour -o /usr/share/keyrings/kubernetes-archive-keyring.gpg
+    - name: Download and add Kubernetes repository GPG key
+      ansible.builtin.shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key | \
+        gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
       args:
-        creates: /usr/share/keyrings/kubernetes-archive-keyring.gpg
-      register: keyring_cmd
-      changed_when: keyring_cmd.rc == 0
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      register: key_result
+      changed_when: "'added' in key_result.stdout or key_result.rc == 0"
+
+    - name: Add Kubernetes repository
+      ansible.builtin.shell: |
+        echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] \
+        https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /" | \
+        tee /etc/apt/sources.list.d/kubernetes.list
+      args:
+        creates: /etc/apt/sources.list.d/kubernetes.list
+      register: repo_result
+      changed_when: "'added' in repo_result.stdout or repo_result.rc == 0"
+
+
+    - name: Update package list
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
 
     - name: Install kubelet, kubeadm, kubectl
       ansible.builtin.apt:
@@ -133,12 +138,21 @@
           - kubectl
         state: present
         update_cache: yes
+      register: kube_install
+      until: kube_install is succeeded
+      retries: 5
+      delay: 10
 
     - name: Hold kube packages
       ansible.builtin.command: apt-mark hold kubelet kubeadm kubectl
-      args:
-        warn: false
       changed_when: false
+
+    - name: Wait for any running apt processes to finish
+      ansible.builtin.wait_for:
+        path: /var/lib/apt/daily-upgrade.lock
+        state: absent
+        timeout: 300
+      ignore_errors: yes
 
     - name: Ensure kubelet is enabled (it may be started by kubeadm later)
       ansible.builtin.systemd:
@@ -159,6 +173,7 @@
   gather_facts: yes
   vars:
     pod_cidr: "192.168.0.0/16"
+    calico_manifest_url: "https://docs.projectcalico.org/manifests/calico.yaml"
   tasks:
     - name: Init kubeadm control plane (only if not already init)
       ansible.builtin.command: >
@@ -185,9 +200,21 @@
         owner: "{{ ansible_user }}"
         group: "{{ ansible_user }}"
         mode: '0600'
+        remote_src: yes
+
+    - name: Wait for API server to be ready
+      ansible.builtin.shell: |
+        until kubectl cluster-info &>/dev/null; do
+          echo "Waiting for API server..."
+          sleep 5
+        done
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      retries: 12
+      delay: 5
 
     - name: Apply Calico CNI manifest
-      ansible.builtin.command: kubectl apply -f {{ calico_manifest_url }}
+      ansible.builtin.command: kubectl apply -f {{ calico_manifest_url }} --validate=false
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
       register: calico_apply
@@ -202,11 +229,25 @@
       register: wait_output
       failed_when: false
 
+    - name: Wait for API server to stabilize after pod deployment
+      ansible.builtin.shell: |
+        until kubectl get nodes &>/dev/null; do
+          echo "Waiting for API server to stabilize..."
+          sleep 5
+        done
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      retries: 12
+      delay: 5
+
     - name: Generate join command
       ansible.builtin.command: kubeadm token create --print-join-command
       register: join_cmd
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
+      retries: 5
+      delay: 10
+      until: join_cmd is succeeded
 
     - name: Save join command to file (for workers)
       ansible.builtin.copy:
@@ -225,10 +266,17 @@
   become: true
   gather_facts: yes
   tasks:
+    - name: Wait for join command file to be created on master
+      ansible.builtin.wait_for:
+        path: /tmp/kube_join_cmd.sh
+        state: present
+        timeout: 300
+      delegate_to: "{{ groups['master'][0] }}"
+
     - name: Fetch join command from master
       ansible.builtin.slurp:
         src: /tmp/kube_join_cmd.sh
-      delegate_to: 192.168.122.18
+      delegate_to: "{{ groups['master'][0] }}"
       register: join_script_b64
 
     - name: Write join script locally on worker
@@ -242,6 +290,9 @@
       args:
         creates: /etc/kubernetes/kubelet.conf
       register: join_result
+      retries: 5
+      delay: 30
+      until: join_result.rc == 0 or 'already a member of the cluster' in join_result.stdout
       failed_when: join_result.rc != 0 and 'already a member of the cluster' not in join_result.stdout
 
     - name: Ensure kubelet is running
@@ -250,18 +301,3 @@
         state: started
         enabled: yes
 
-- name: Pull admin kubeconfig to control machine (local)
-  hosts: master
-  connection: local
-  gather_facts: no
-  tasks:
-    - name: Create local .kube dir
-      local_action: file path=~/.kube state=directory mode=0700
-
-    - name: Copy admin.conf from master to local control host
-      local_action: command scp -o StrictHostKeyChecking=no {{ ansible_user }}@{{ inventory_hostname }}:/etc/kubernetes/admin.conf ~/.kube/config
-      # If you use SSH keys & known_hosts, remove StrictHostKeyChecking option
-
-    - name: Fix local kubeconfig ownership
-      local_action: command chown $(id -u):$(id -g) ~/.kube/config
-      ignore_errors: true

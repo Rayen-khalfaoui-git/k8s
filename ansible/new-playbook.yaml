@@ -1,0 +1,490 @@
+---
+- name: Prepare all nodes for Kubernetes
+  hosts: all
+  become: true
+  gather_facts: yes
+  vars:
+    kubernetes_version: "1.30"
+    pod_cidr: "192.168.0.0/16"
+  
+  tasks:
+    - name: Wait for apt locks to be released
+      ansible.builtin.shell: |
+        while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 ; do
+          echo "Waiting for apt lock..."
+          sleep 5
+        done
+      changed_when: false
+
+    - name: Stop and disable unattended-upgrades
+      ansible.builtin.systemd:
+        name: unattended-upgrades
+        state: stopped
+        enabled: no
+      ignore_errors: yes
+
+    - name: Kill any running apt/dpkg processes
+      ansible.builtin.shell: |
+        killall apt apt-get dpkg 2>/dev/null || true
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Wait a moment for processes to terminate
+      ansible.builtin.pause:
+        seconds: 3
+
+    - name: Disable swap permanently
+      ansible.builtin.shell: |
+        swapoff -a
+        sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+
+    - name: Load kernel modules
+      community.general.modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Ensure kernel modules load on boot
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+        mode: '0644'
+
+    - name: Configure sysctl for Kubernetes
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-kubernetes-cri.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.ipv4.ip_forward                 = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+        mode: '0644'
+
+    - name: Apply sysctl settings
+      ansible.builtin.command: sysctl --system
+      changed_when: false
+
+    - name: Install required packages
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - software-properties-common
+        state: present
+        update_cache: yes
+
+    - name: Install containerd
+      ansible.builtin.apt:
+        name: containerd
+        state: present
+        update_cache: yes
+
+    - name: Create containerd config directory
+      ansible.builtin.file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+
+    - name: Generate default containerd config
+      ansible.builtin.shell: containerd config default
+      register: containerd_config_default
+      changed_when: false
+
+    - name: Write containerd config
+      ansible.builtin.copy:
+        dest: /etc/containerd/config.toml
+        content: "{{ containerd_config_default.stdout }}"
+        mode: '0644'
+
+    - name: Enable SystemdCgroup in containerd
+      ansible.builtin.lineinfile:
+        path: /etc/containerd/config.toml
+        regexp: '^\s*SystemdCgroup\s*=\s*false'
+        line: '            SystemdCgroup = true'
+        backrefs: yes
+
+    - name: Restart containerd
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Create keyrings directory
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Add Kubernetes GPG key
+      ansible.builtin.shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/Release.key | \
+        gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Add Kubernetes repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/ /"
+        state: present
+        filename: kubernetes
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+
+    - name: Install Kubernetes packages
+      ansible.builtin.apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+
+    - name: Hold Kubernetes packages
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    - name: Enable kubelet service
+      ansible.builtin.systemd:
+        name: kubelet
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Check if ufw is active
+      ansible.builtin.command: ufw status
+      register: ufw_status
+      changed_when: false
+      failed_when: false
+
+    - name: Disable UFW firewall (if active)
+      ansible.builtin.systemd:
+        name: ufw
+        state: stopped
+        enabled: no
+      when: "'active' in ufw_status.stdout"
+      ignore_errors: yes
+
+- name: Configure firewall on master
+  hosts: master
+  become: true
+  gather_facts: yes
+
+  tasks:
+    - name: Allow Kubernetes API server port
+      ansible.builtin.iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: 6443
+        jump: ACCEPT
+        comment: Kubernetes API server
+      ignore_errors: yes
+
+    - name: Allow etcd ports
+      ansible.builtin.iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "{{ item }}"
+        jump: ACCEPT
+      loop:
+        - 2379
+        - 2380
+      ignore_errors: yes
+
+    - name: Save iptables rules
+      ansible.builtin.shell: |
+        iptables-save > /etc/iptables/rules.v4 || true
+      ignore_errors: yes
+      changed_when: false
+
+- name: Initialize Kubernetes master
+  hosts: master
+  become: true
+  gather_facts: yes
+  vars:
+    pod_cidr: "192.168.0.0/16"
+  
+  tasks:
+    - name: Check if Kubernetes is already initialized
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: k8s_initialized
+
+    - name: Initialize Kubernetes cluster
+      ansible.builtin.command: >
+        kubeadm init
+        --apiserver-advertise-address={{ ansible_default_ipv4.address }}
+        --pod-network-cidr={{ pod_cidr }}
+        --cri-socket=unix:///var/run/containerd/containerd.sock
+      when: not k8s_initialized.stat.exists
+      register: kubeadm_init_output
+
+    - name: Fix etcd liveness probe immediately - failureThreshold
+      ansible.builtin.replace:
+        path: /etc/kubernetes/manifests/etcd.yaml
+        regexp: 'failureThreshold: 8'
+        replace: 'failureThreshold: 24'
+
+    - name: Fix etcd liveness probe immediately - initialDelaySeconds
+      ansible.builtin.replace:
+        path: /etc/kubernetes/manifests/etcd.yaml
+        regexp: 'initialDelaySeconds: 10'
+        replace: 'initialDelaySeconds: 30'
+
+    - name: Fix etcd liveness probe immediately - periodSeconds
+      ansible.builtin.replace:
+        path: /etc/kubernetes/manifests/etcd.yaml
+        regexp: 'periodSeconds: 10'
+        replace: 'periodSeconds: 20'
+
+    - name: Wait a moment for kubelet to restart etcd with new config
+      ansible.builtin.pause:
+        seconds: 15
+
+    - name: Wait for Kubernetes API server to be ready
+      ansible.builtin.wait_for:
+        host: "{{ ansible_default_ipv4.address }}"
+        port: 6443
+        delay: 5
+        timeout: 300
+
+    - name: Create .kube directory
+      ansible.builtin.file:
+        path: "/home/{{ ansible_user }}/.kube"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+
+    - name: Copy kubeconfig to user directory
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "/home/{{ ansible_user }}/.kube/config"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0600'
+        remote_src: yes
+
+    - name: Create .kube directory for root
+      ansible.builtin.file:
+        path: /root/.kube
+        state: directory
+        mode: '0755'
+
+    - name: Copy kubeconfig to root directory
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        mode: '0600'
+        remote_src: yes
+
+    - name: Wait for API server to respond
+      ansible.builtin.command: kubectl cluster-info
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: cluster_info
+      until: cluster_info.rc == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Install Calico Tigera Operator
+      ansible.builtin.command: >
+        kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/tigera-operator.yaml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: operator_result
+      failed_when: 
+        - operator_result.rc != 0
+        - '"already exists" not in operator_result.stderr'
+      changed_when: '"created" in operator_result.stdout'
+
+    - name: Wait for Tigera operator to be ready
+      ansible.builtin.pause:
+        seconds: 15
+
+    - name: Create Calico Installation custom resource
+      ansible.builtin.copy:
+        dest: /tmp/calico-installation.yaml
+        content: |
+          apiVersion: operator.tigera.io/v1
+          kind: Installation
+          metadata:
+            name: default
+          spec:
+            calicoNetwork:
+              ipPools:
+              - blockSize: 26
+                cidr: {{ pod_cidr }}
+                encapsulation: VXLANCrossSubnet
+                natOutgoing: Enabled
+                nodeSelector: all()
+        mode: '0644'
+
+    - name: Apply Calico Installation
+      ansible.builtin.command: kubectl apply -f /tmp/calico-installation.yaml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: calico_result
+      changed_when: '"configured" in calico_result.stdout or "created" in calico_result.stdout'
+
+    - name: Wait for Calico pods to be created
+      ansible.builtin.pause:
+        seconds: 30
+
+    - name: Wait for core system pods to be ready (etcd, apiserver, controller-manager, scheduler)
+      ansible.builtin.shell: |
+        kubectl wait --for=condition=Ready pod -l tier=control-plane -n kube-system --timeout=300s 2>/dev/null || true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Wait for additional system pods (allow failures as some may still be starting)
+      ansible.builtin.shell: |
+        kubectl wait --for=condition=Ready pods --all -n kube-system --timeout=120s 2>/dev/null || true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Verify API server is responding
+      ansible.builtin.command: kubectl cluster-info
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: cluster_info_check
+      until: cluster_info_check.rc == 0
+      retries: 20
+      delay: 15
+      changed_when: false
+
+    - name: Generate join command
+      ansible.builtin.command: kubeadm token create --print-join-command
+      register: join_command_output
+      changed_when: false
+
+    - name: Save join command to file on master
+      ansible.builtin.copy:
+        content: "{{ join_command_output.stdout }}"
+        dest: /tmp/kubernetes_join_command.sh
+        mode: '0644'
+
+    - name: Fetch join command to ansible controller
+      ansible.builtin.fetch:
+        src: /tmp/kubernetes_join_command.sh
+        dest: /tmp/kubernetes_join_command.sh
+        flat: yes
+
+    - name: Display cluster status
+      ansible.builtin.command: kubectl get nodes
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: nodes_status
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Show cluster nodes
+      ansible.builtin.debug:
+        msg: "{{ nodes_status.stdout_lines }}"
+      when: nodes_status.rc == 0
+
+- name: Join worker nodes to cluster
+  hosts: workers
+  become: true
+  gather_facts: yes
+  
+  tasks:
+    - name: Test connectivity to API server
+      ansible.builtin.wait_for:
+        host: "{{ hostvars[groups['master'][0]]['ansible_default_ipv4']['address'] }}"
+        port: 6443
+        timeout: 10
+      register: api_connectivity
+      ignore_errors: yes
+
+    - name: Display connectivity result
+      ansible.builtin.debug:
+        msg: "API server connectivity: {{ 'SUCCESS' if api_connectivity.failed == false else 'FAILED - Check firewall/network' }}"
+
+    - name: Check if node is already in cluster
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+
+    - name: Copy join command to worker
+      ansible.builtin.copy:
+        src: /tmp/kubernetes_join_command.sh
+        dest: /tmp/kubernetes_join_command.sh
+        mode: '0755'
+      when: not kubelet_conf.stat.exists
+
+    - name: Read join command
+      ansible.builtin.slurp:
+        src: /tmp/kubernetes_join_command.sh
+      register: join_command_content
+      when: not kubelet_conf.stat.exists
+
+    - name: Join cluster
+      ansible.builtin.shell: "{{ join_command_content.content | b64decode | trim }} --cri-socket=unix:///var/run/containerd/containerd.sock"
+      when: not kubelet_conf.stat.exists
+      register: join_result
+
+    - name: Restart kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+
+- name: Verify cluster setup
+  hosts: master
+  become: true
+  gather_facts: no
+  
+  tasks:
+    - name: Wait for all nodes to join
+      ansible.builtin.pause:
+        seconds: 30
+
+    - name: Get all nodes
+      ansible.builtin.command: kubectl get nodes -o wide
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: all_nodes
+      changed_when: false
+
+    - name: Display all nodes
+      ansible.builtin.debug:
+        msg: "{{ all_nodes.stdout_lines }}"
+
+    - name: Get all pods
+      ansible.builtin.command: kubectl get pods -A -o wide
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: all_pods
+      changed_when: false
+
+    - name: Display all pods
+      ansible.builtin.debug:
+        msg: "{{ all_pods.stdout_lines }}"
+
+    - name: Final message
+      ansible.builtin.debug:
+        msg: 
+          - "=========================================="
+          - "Kubernetes cluster setup complete!"
+          - "=========================================="
+          - "Access the cluster with:"
+          - "  ssh {{ ansible_user }}@{{ ansible_default_ipv4.address }}"
+          - "  kubectl get nodes"
+          - "=========================================="
